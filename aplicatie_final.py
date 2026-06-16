@@ -18,11 +18,14 @@ from io import BytesIO
 from flask import send_file
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+import sqlite3 # <--- NOU: Adaugat pentru baza de date
+
 # --- SETĂRI GLOBALE ---
 SKIP_FRAMES = 1 
 CONF_THRESH = 0.40 
 CONFIG_FILE = "cameras.json"
 HISTORY_FILE = "history.json"
+DB_FILE = "traffic_events.db" # <--- NOU: Fisierul bazei de date
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|timeout;2000"
 
 app = Flask(__name__)
@@ -35,6 +38,16 @@ latest_frames = {}
 system_logs = []     
 
 TIME_SLOTS = [f"{h:02d}:00-{h+2:02d}:00" for h in range(0, 24, 2)]
+
+# --- NOU: INITIALIZARE BAZA DE DATE ---
+def init_db():
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS events
+                        (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         cam_id TEXT,
+                         event_type TEXT,
+                         timestamp DATETIME)''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON events(timestamp)')
 
 def get_current_slot():
     now = datetime.now()
@@ -193,6 +206,7 @@ def process_camera(cam_id):
                             
                             current_slot = get_current_slot()
                             today = datetime.now().strftime("%Y-%m-%d")
+                            now_db_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S") # NOU: Timp pentru DB
                             init_camera_structures(cam_id)
                             
                             if cam_id in camera_data:
@@ -200,10 +214,17 @@ def process_camera(cam_id):
                                     camera_data[cam_id]["in"] += 1
                                     history_data[today][cam_id][current_slot]["in"] += 1
                                     add_log(f"{cameras_config[cam_id]['name']} ({camera_data[cam_id]['location']})", "INTRARE") 
+                                    # --- NOU: INSERARE IN BAZA DE DATE ---
+                                    with sqlite3.connect(DB_FILE, timeout=10) as conn:
+                                        conn.execute("INSERT INTO events (cam_id, event_type, timestamp) VALUES (?, 'IN', ?)", (cam_id, now_db_str))
                                 else:
                                     camera_data[cam_id]["out"] += 1
                                     history_data[today][cam_id][current_slot]["out"] += 1
                                     add_log(f"{cameras_config[cam_id]['name']} ({camera_data[cam_id]['location']})", "IESIRE")
+                                    # --- NOU: INSERARE IN BAZA DE DATE ---
+                                    with sqlite3.connect(DB_FILE, timeout=10) as conn:
+                                        conn.execute("INSERT INTO events (cam_id, event_type, timestamp) VALUES (?, 'OUT', ?)", (cam_id, now_db_str))
+                                
                                 counted_ids.append(track_id)
                                 save_history() 
 
@@ -230,14 +251,42 @@ def stop_camera_thread(cam_id):
 @app.route('/data')
 def data(): return jsonify({"live": camera_data, "logs": system_logs})
 
+# --- NOU: RUTA PENTRU INTEROGAREA LA ORA EXACTA ---
+@app.route('/api_exact_time', methods=['POST'])
+def api_exact_time():
+    req = request.json
+    target_dt = req.get('datetime')
+    if not target_dt: return jsonify({"success": False})
+    
+    # Includem toate secundele pana la sfarsitul minutului cerut
+    target_dt += ":59" 
+    
+    result = {}
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            # Numaram totalul de IN si OUT care au avut loc INAINTE sau EXACT la ora ceruta
+            cursor.execute('''
+                SELECT cam_id, 
+                       SUM(CASE WHEN event_type = 'IN' THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN event_type = 'OUT' THEN 1 ELSE 0 END)
+                FROM events 
+                WHERE timestamp <= ?
+                GROUP BY cam_id
+            ''', (target_dt,))
+            for row in cursor.fetchall():
+                result[row[0]] = {"in": row[1] or 0, "out": row[2] or 0}
+    except Exception as e:
+        print("Eroare DB:", e)
+        return jsonify({"success": False})
+        
+    return jsonify({"success": True, "data": result})
+
 @app.route('/api_history', methods=['POST'])
 def api_history():
     req = request.json
     date_req = req.get('date', datetime.now().strftime("%Y-%m-%d"))
-    
-    if date_req not in history_data:
-        return jsonify({"success": False, "data": {}})
-    
+    if date_req not in history_data: return jsonify({"success": False, "data": {}})
     return jsonify({"success": True, "data": history_data[date_req]})
 
 @app.route('/get_cameras')
@@ -329,12 +378,10 @@ def export_history():
     
     if 'ALL' in req_slots: req_slots = TIME_SLOTS
     
-    # Creăm direct fișierul Excel în memorie
     wb = Workbook()
     ws = wb.active
     ws.title = f"Raport {req_date}"
     
-    # --- DEFINIRE STILURI EXCEL ---
     header_fill = PatternFill(start_color="4facfe", end_color="4facfe", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
     center_align = Alignment(horizontal="center", vertical="center")
@@ -345,7 +392,6 @@ def export_history():
     total_font = Font(bold=True)
     total_fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
 
-    # --- CAP DE TABEL ---
     headers = ['Locatie', 'Camera', 'Interval', 'IN', 'OUT', 'Persoane in Interior']
     ws.append(headers)
     for col_idx in range(1, len(headers) + 1):
@@ -356,11 +402,8 @@ def export_history():
         cell.border = thin_border
         
     day_data = history_data.get(req_date, {})
-    total_in = 0
-    total_out = 0
-    row_num = 2
+    total_in = 0; total_out = 0; row_num = 2
     
-    # --- SCRIERE DATE ---
     for cid, slots in day_data.items():
         if 'ALL' in req_cams or cid in req_cams:
             cam_info = cameras_config.get(cid, {})
@@ -369,31 +412,22 @@ def export_history():
             
             for slot in req_slots:
                 stats = slots.get(slot, {"in":0, "out":0})
-                t_in = stats['in']
-                t_out = stats['out']
-                inside = t_in - t_out
-                
-                total_in += t_in
-                total_out += t_out
+                t_in = stats['in']; t_out = stats['out']; inside = t_in - t_out
+                total_in += t_in; total_out += t_out
                 
                 ws.append([cam_loc, cam_name, slot, t_in, t_out, inside])
                 
-                # Formatare celule rând curent
                 for c_idx in range(1, 7):
                     cell = ws.cell(row=row_num, column=c_idx)
                     cell.alignment = center_align
                     cell.border = thin_border
                 
-                # Culoare verde pentru IN, roșu pentru OUT
                 ws.cell(row=row_num, column=4).font = in_font
                 ws.cell(row=row_num, column=5).font = out_font
-                
                 row_num += 1
                 
-    # --- RÂND GOL ȘI TOTAL GENERAL ---
     ws.append([])
     row_num += 1
-    
     ws.append(["", "TOTAL GENERAL", "PENTRU FILTRELE ALESE", total_in, total_out, total_in - total_out])
     for c_idx in range(1, 7):
         cell = ws.cell(row=row_num, column=c_idx)
@@ -404,19 +438,15 @@ def export_history():
         if c_idx == 4: cell.font = Font(color="008000", bold=True)
         if c_idx == 5: cell.font = Font(color="FF0000", bold=True)
         
-    # --- AUTO-AJUSTARE LĂȚIME COLOANE ---
     for col in ws.columns:
         max_length = 0
         column = col[0].column_letter
         for cell in col:
             try:
-                if len(str(cell.value)) > max_length:
-                    max_length = len(str(cell.value))
-            except:
-                pass
+                if len(str(cell.value)) > max_length: max_length = len(str(cell.value))
+            except: pass
         ws.column_dimensions[column].width = max_length + 4
 
-    # Salvăm în memorie și trimitem direct către browser
     output = BytesIO()
     wb.save(output)
     output.seek(0)
@@ -427,35 +457,6 @@ def export_history():
         download_name=f"Raport_Trafic_{req_date}.xlsx", 
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-    
-    if 'ALL' in req_slots: req_slots = TIME_SLOTS
-    
-    si = StringIO(); cw = csv.writer(si)
-    header = ['Locatie', 'Camera', 'Interval', 'IN', 'OUT', 'Persoane in Interior']
-    cw.writerow(header)
-    
-    day_data = history_data.get(req_date, {})
-    total_in = 0
-    total_out = 0
-    
-    for cid, slots in day_data.items():
-        if 'ALL' in req_cams or cid in req_cams:
-            cam_info = cameras_config.get(cid, {})
-            cam_name = cam_info.get("name", cid)
-            cam_loc = cam_info.get("location", "General")
-            for slot in req_slots:
-                stats = slots.get(slot, {"in":0, "out":0})
-                total_in += stats['in']
-                total_out += stats['out']
-                cw.writerow([cam_loc, cam_name, slot, stats['in'], stats['out'], stats['in'] - stats['out']])
-                
-    cw.writerow([])
-    cw.writerow(["", "TOTAL GENERAL", "FILTRAT", total_in, total_out, total_in - total_out])
-                
-    output = make_response(si.getvalue())
-    output.headers["Content-Disposition"] = f"attachment; filename=istoric_{req_date}.csv"
-    output.headers["Content-type"] = "text/csv"
-    return output
 
 def generate_frames(cam_id):
     while True:
@@ -536,12 +537,31 @@ HTML_PAGE = """
 
     <div class="tabs">
         <button id="btn-live" class="tab-btn active" onclick="switchTab('live')">📊 Monitorizare Live</button>
+        <button id="btn-exact" class="tab-btn" onclick="switchTab('exact')">⏱️ Căutare la Minut</button>
         <button id="btn-history" class="tab-btn" onclick="switchTab('history'); loadHistoryData();">📈 Căutare Istoric</button>
         <button id="btn-logs" class="tab-btn" onclick="switchTab('logs')">📋 Loguri Detaliate</button>
         <button id="btn-config" class="tab-btn" onclick="switchTab('config'); loadCams();">⚙️ Echipamente</button>
     </div>
 
     <div id="live" class="tab-content active"><div id="live-container"></div></div>
+
+    <div id="exact" class="tab-content">
+        <div class="form-container" style="max-width: 800px;">
+            <h2 style="color:#ffb300; margin-top:0;">Câte persoane erau în interior la un moment dat?</h2>
+            <label style="color:#aaa; font-weight:bold;">Selectează Data și Ora exactă:</label>
+            <input type="datetime-local" id="exact-datetime-input" style="font-size: 1.2em;">
+            <button class="btn-submit" onclick="fetchExactTime()" style="background:#ffb300;">🔍 Calculează Persoanele</button>
+            
+            <div id="exact-results" style="margin-top:30px; display:none;">
+                <table style="width:100%;">
+                    <thead>
+                        <tr><th>Locație</th><th>Cameră</th><th>Au Intrat<br><span style="font-size:0.8em;color:#aaa;">(până la ora aleasă)</span></th><th>Au Ieșit<br><span style="font-size:0.8em;color:#aaa;">(până la ora aleasă)</span></th><th>Persoane În Interior</th></tr>
+                    </thead>
+                    <tbody id="exact-body"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
 
     <div id="history" class="tab-content">
         <div style="max-width: 1400px; margin: 0 auto;">
@@ -653,7 +673,7 @@ HTML_PAGE = """
     <script>
         const TIME_SLOTS_JS = ["00:00-02:00", "02:00-04:00", "04:00-06:00", "06:00-08:00", "08:00-10:00", "10:00-12:00", "12:00-14:00", "14:00-16:00", "16:00-18:00", "18:00-20:00", "20:00-22:00", "22:00-24:00"];
         let currentLiveDataCache = {};
-        let cameraConfigCache = {}; // stocam config aici pt filtre
+        let cameraConfigCache = {}; 
         let activeDrawCamId = null;
 
         document.getElementById('hist-date').valueAsDate = new Date();
@@ -678,7 +698,50 @@ HTML_PAGE = """
             return Array.from(document.getElementById(selectId).selectedOptions).map(opt => opt.value);
         }
 
-        // FUNCTIE PENTRU FILTRAREA CAMERELOR DUPA LOCATIE IN ISTORIC
+        // --- NOU: FUNCTIA JAVASCRIPT PENTRU CAUTAREA EXACTA ---
+        function fetchExactTime() {
+            const dt = document.getElementById('exact-datetime-input').value;
+            if(!dt) return alert("Alege data și ora!");
+            
+            // Format HTML5 datetime-local este YYYY-MM-DDTHH:MM, trebuie sa inlocuim T cu spatiu pentru SQLite
+            const formattedDt = dt.replace('T', ' ');
+
+            fetch('/api_exact_time', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({datetime: formattedDt})
+            }).then(r=>r.json()).then(res => {
+                if(!res.success) return alert("Eroare la interogarea bazei de date.");
+                
+                const tbody = document.getElementById('exact-body');
+                tbody.innerHTML = '';
+                let found = false;
+                
+                Object.keys(cameraConfigCache).forEach(cid => {
+                    const data = res.data[cid];
+                    if(data) {
+                        found = true;
+                        const inside = data.in - data.out;
+                        const loc = cameraConfigCache[cid].location || 'General';
+                        const name = cameraConfigCache[cid].name || cid;
+                        
+                        tbody.innerHTML += `<tr>
+                            <td style="color:#ffb300; font-weight:bold;">${loc}</td>
+                            <td style="color:#4facfe; font-weight:bold;">${name}</td>
+                            <td style="color:#00e676;">${data.in}</td>
+                            <td style="color:#ff1744;">${data.out}</td>
+                            <td style="font-weight:bold; font-size:1.5em; color:#fff;">${inside}</td>
+                        </tr>`;
+                    }
+                });
+                
+                if(!found) {
+                    tbody.innerHTML = `<tr><td colspan="5" style="color:#ff1744; padding:20px;">Nu există evenimente înregistrate până la această dată/oră.</td></tr>`;
+                }
+                document.getElementById('exact-results').style.display = 'block';
+            });
+        }
+
         function filterCamsByLocation() {
             const locValues = getMultiSelectValues('hist-locs');
             const camSelect = document.getElementById('hist-cam');
@@ -718,7 +781,6 @@ HTML_PAGE = """
                     return;
                 }
                 
-                // Determinam id-urile permise de filtrul de camere
                 let allowedIds = [];
                 if(camValues.includes("ALL")) {
                     Array.from(document.getElementById('hist-cam').options).forEach(opt => {
@@ -793,7 +855,7 @@ HTML_PAGE = """
 
         function loadCams() {
             fetch('/get_cameras').then(r=>r.json()).then(data => {
-                cameraConfigCache = data; // stocam pentru filtru locatie
+                cameraConfigCache = data; 
                 const b = document.getElementById('cam-table'); b.innerHTML = '';
                 
                 const hLocSelect = document.getElementById('hist-locs');
@@ -807,7 +869,7 @@ HTML_PAGE = """
                 });
                 
                 unice.forEach(l => hLocSelect.innerHTML += `<option value="${l}">${l}</option>`);
-                filterCamsByLocation(); // populeaza al doilea dropdown
+                filterCamsByLocation(); 
             });
         }
 
@@ -847,17 +909,15 @@ HTML_PAGE = """
 
         loadCams();
 
-        // --- UPDATE DATE LIVE IN FUNDAL (GRUPAT PE LOCATII) ---
         setInterval(() => {
             fetch('/data').then(r=>r.json()).then(d => {
                 currentLiveDataCache = d.live;
                 const container = document.getElementById('live-container');
                 
-                // Creare structura pe locatii daca nu exista
                 Object.keys(d.live).forEach(id => {
                     const info = d.live[id];
                     let locName = info.location || "General";
-                    let safeLocId = "loc-" + locName.replace(/\W/g, ''); // id valid fara spatii
+                    let safeLocId = "loc-" + locName.replace(/\W/g, ''); 
                     
                     let locSection = document.getElementById(safeLocId);
                     if(!locSection) {
@@ -882,7 +942,6 @@ HTML_PAGE = """
                             <button class="btn-play" onclick="openViewModal('${id}')">🎥 Afișează Camera (Live)</button>
                         `;
                     } else {
-                        // Mutam cardul in sectiunea potrivita daca s-a schimbat locatia (in viitor)
                         if(c.parentElement !== g) g.appendChild(c); 
                         
                         document.getElementById(`in-${id}`).innerText = info.in; document.getElementById(`out-${id}`).innerText = info.out;
@@ -892,7 +951,6 @@ HTML_PAGE = """
                     if(document.getElementById(`stat-${id}`)) document.getElementById(`stat-${id}`).innerText = s_ui;
                 });
                 
-                // Curatare camere/sectiuni vechi sterse
                 Array.from(document.querySelectorAll('.card')).forEach(card => {
                     let cid = card.id.replace('card-','');
                     if(!d.live[cid]) card.remove();
@@ -914,6 +972,7 @@ HTML_PAGE = """
 def index(): return render_template_string(HTML_PAGE)
 
 if __name__ == '__main__':
+    init_db() 
     load_data()
     for cid in cameras_config: init_camera_structures(cid); start_camera_thread(cid)
     app.run(host='0.0.0.0', port=5000)
