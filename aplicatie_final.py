@@ -639,7 +639,7 @@ HTML_PAGE = """
             </div>
             <button class="btn-submit" onclick="saveCam()">✅ Salvează Parametrii</button>
         </div>
-        <table><thead><tr><th>Locație</th><th>Nume Sursă</th><th>Informații Retea</th><th>Status</th><th>Acțiuni</th></tr></thead><tbody id="cam-table"></tbody></table>
+        <table><thead><tr><th>Locație</th><th>Nume Sursă</th><th>Informații Reteaa</th><th>Status</th><th>Acțiuni</th></tr></thead><tbody id="cam-table"></tbody></table>
     </div>
 
     <div id="view-modal" class="modal-overlay">
