@@ -2,3 +2,4 @@ Flask
 gunicorn
 ultralytics
 opencv-python-headless
+openpyxl
